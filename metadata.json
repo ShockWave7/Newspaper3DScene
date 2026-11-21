@@ -1,0 +1,6 @@
+{
+  "name": "Forma3D Studio",
+  "description": "Интерактивный визуальный 3D-редактор сцен Three.js с инспектором свойств, импортом моделей .glb и сохранением проектов.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
