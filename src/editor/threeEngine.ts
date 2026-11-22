@@ -5,9 +5,12 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { ProceduralEquirectTexture, WebGLPathTracer } from 'three-gpu-pathtracer';
+import { OidnDenoiserService, createImageDataFromGlRgba } from './oidnDenoiser';
 import { clamp, degToRad, radToDeg, resolveViewportLighting, roundTo, type SceneLightStatus } from './sceneModel';
 import type {
   CameraState,
+  DenoiserStatus,
+  DenoiserViewMode,
   GlbMetadata,
   LightProps,
   MaterialProps,
@@ -172,6 +175,7 @@ export interface EngineCallbacks {
   onCameraChange: (camera: CameraState) => void;
   onContextLostChange?: (lost: boolean) => void;
   onPathTracerStatusChange?: (status: PathTracerStatus) => void;
+  onDenoiserStatusChange?: (status: DenoiserStatus) => void;
 }
 
 interface PathTracerDirtyFlags {
@@ -226,6 +230,15 @@ export class ThreeViewportEngine {
     reset: true,
   };
   private lastReportedPtStatusKey = '';
+  private denoiserOverlayCanvas: HTMLCanvasElement;
+  private denoiserService: OidnDenoiserService;
+  private denoisedForCurrentRun = false;
+  private ptCaptureScene: THREE.Scene | null = null;
+  private ptCaptureCamera: THREE.OrthographicCamera | null = null;
+  private ptCaptureMaterial: THREE.ShaderMaterial | null = null;
+  private ptCaptureMesh: THREE.Mesh | null = null;
+  private ptCaptureTarget: THREE.WebGLRenderTarget | null = null;
+  private ptCaptureBuffer: Uint8Array | null = null;
 
   private selectedNodeId: string | null = null;
   private transformMode: TransformMode = 'translate';
@@ -281,10 +294,31 @@ export class ThreeViewportEngine {
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.domElement.style.display = 'block';
+    this.renderer.domElement.style.position = 'relative';
+    this.renderer.domElement.style.zIndex = '1';
     this.renderer.domElement.style.width = '100%';
     this.renderer.domElement.style.height = '100%';
     this.renderer.domElement.setAttribute('data-testid', 'three-canvas');
     container.appendChild(this.renderer.domElement);
+
+    if (getComputedStyle(container).position === 'static') {
+      container.style.position = 'relative';
+    }
+    this.denoiserOverlayCanvas = document.createElement('canvas');
+    this.denoiserOverlayCanvas.style.position = 'absolute';
+    this.denoiserOverlayCanvas.style.inset = '0';
+    this.denoiserOverlayCanvas.style.zIndex = '5';
+    this.denoiserOverlayCanvas.style.width = '100%';
+    this.denoiserOverlayCanvas.style.height = '100%';
+    this.denoiserOverlayCanvas.style.pointerEvents = 'none';
+    this.denoiserOverlayCanvas.style.display = 'none';
+    this.denoiserOverlayCanvas.setAttribute('data-testid', 'oidn-denoised-canvas');
+    container.appendChild(this.denoiserOverlayCanvas);
+
+    this.denoiserService = new OidnDenoiserService((status) => {
+      this.syncDenoiserOverlayVisibility(status);
+      this.callbacks.onDenoiserStatusChange?.(status);
+    });
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(initialSettings.backgroundColor);
@@ -382,6 +416,7 @@ export class ThreeViewportEngine {
     this.orbitControls.addEventListener('start', () => {
       this.cameraAnim.active = false;
       this.notifyPathTracerInteraction({ camera: true });
+      this.requestRender();
     });
 
     this.orbitControls.addEventListener('change', () => {
@@ -529,7 +564,7 @@ export class ThreeViewportEngine {
       pt.fadeDuration = 0;
       pt.minSamples = 1;
       pt.rasterizeScene = false;
-      pt.tiles.set(this.isSoftwareGl ? 4 : 2, this.isSoftwareGl ? 4 : 2);
+      pt.tiles.set(this.isSoftwareGl ? 1 : 2, this.isSoftwareGl ? 1 : 2);
       pt.multipleImportanceSampling = true;
       pt.filterGlossyFactor = 0.5;
       this.pathTracer = pt;
@@ -561,6 +596,7 @@ export class ThreeViewportEngine {
 
     if (!this.isPathTracerEnabled()) return;
 
+    this.invalidateDenoiser();
     clearTimeout(this.pathTracerIdleTimer);
     if (immediate) {
       this.pathTracerInteracting = false;
@@ -569,6 +605,11 @@ export class ThreeViewportEngine {
     }
 
     this.pathTracerInteracting = true;
+    this.reportPathTracerStatus({
+      phase: 'preview',
+      samples: 0,
+      maxSamples: this.currentSettings.pathTracer.maxSamples,
+    });
     this.pathTracerIdleTimer = window.setTimeout(() => {
       if (this.disposed) return;
       this.pathTracerInteracting = false;
@@ -577,10 +618,151 @@ export class ThreeViewportEngine {
   }
 
   public resetPathTracer(): void {
+    this.invalidateDenoiser();
     clearTimeout(this.pathTracerIdleTimer);
     this.pathTracerInteracting = false;
     this.ptDirty.reset = true;
+    if (this.isPathTracerEnabled()) {
+      this.reportPathTracerStatus({
+        phase: this.currentSettings.pathTracer.paused ? 'paused' : 'tracing',
+        samples: 0,
+        maxSamples: this.currentSettings.pathTracer.maxSamples,
+      });
+    }
     this.requestRender();
+  }
+
+  public setDenoiserViewMode(mode: DenoiserViewMode): void {
+    const status = this.denoiserService.setViewMode(mode);
+    this.syncDenoiserOverlayVisibility(status);
+  }
+
+  private syncDenoiserOverlayVisibility(status = this.denoiserService.getStatus()): void {
+    const hasDisplayableFrames =
+      status.phase === 'denoising' || (status.hasResult && status.phase === 'ready');
+    const visible =
+      this.isPathTracerEnabled() &&
+      !this.pathTracerInteracting &&
+      hasDisplayableFrames &&
+      status.viewMode === 'denoised';
+    this.denoiserOverlayCanvas.style.display = visible ? 'block' : 'none';
+  }
+
+  private invalidateDenoiser(): void {
+    this.denoisedForCurrentRun = false;
+    this.denoiserOverlayCanvas.style.display = 'none';
+    this.denoiserService.cancel();
+  }
+
+  private capturePathTracerTargetImageData(pt: WebGLPathTracer): ImageData | null {
+    const srcTarget = pt.target;
+    const w = srcTarget?.width ?? 0;
+    const h = srcTarget?.height ?? 0;
+    if (w <= 0 || h <= 0 || !srcTarget.texture) {
+      return null;
+    }
+
+    if (!this.ptCaptureScene) {
+      this.ptCaptureScene = new THREE.Scene();
+      this.ptCaptureCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      this.ptCaptureMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+          map: { value: null },
+          uExposure: { value: this.renderer.toneMappingExposure },
+        },
+        vertexShader: /* glsl */ `
+          void main() {
+            gl_Position = vec4(position.xy, 0.0, 1.0);
+          }
+        `,
+        fragmentShader: /* glsl */ `
+          #include <tonemapping_pars_fragment>
+          #include <colorspace_pars_fragment>
+          uniform sampler2D map;
+          uniform float uExposure;
+
+          vec3 applyACESFilmic(vec3 color, float exposure) {
+            const mat3 ACESInputMat = mat3(
+              vec3( 0.59719, 0.07600, 0.02840 ),
+              vec3( 0.35458, 0.90834, 0.13383 ),
+              vec3( 0.04823, 0.01566, 0.83777 )
+            );
+            const mat3 ACESOutputMat = mat3(
+              vec3(  1.60475, -0.10208, -0.00327 ),
+              vec3( -0.53108,  1.10813, -0.07276 ),
+              vec3( -0.07367, -0.00605,  1.07602 )
+            );
+            color *= exposure / 0.6;
+            color = ACESInputMat * color;
+            color = RRTAndODTFit(color);
+            color = ACESOutputMat * color;
+            return clamp(color, 0.0, 1.0);
+          }
+
+          void main() {
+            vec4 raw = texelFetch(map, ivec2(gl_FragCoord.xy), 0);
+            vec3 mapped = applyACESFilmic(max(raw.rgb, vec3(0.0)), uExposure);
+            gl_FragColor = sRGBTransferOETF(vec4(mapped, 1.0));
+          }
+        `,
+        depthTest: false,
+        depthWrite: false,
+      });
+      this.ptCaptureMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.ptCaptureMaterial);
+      this.ptCaptureMesh.frustumCulled = false;
+      this.ptCaptureScene.add(this.ptCaptureMesh);
+    }
+
+    if (!this.ptCaptureTarget) {
+      this.ptCaptureTarget = new THREE.WebGLRenderTarget(w, h, {
+        format: THREE.RGBAFormat,
+        type: THREE.UnsignedByteType,
+        minFilter: THREE.NearestFilter,
+        magFilter: THREE.NearestFilter,
+        colorSpace: THREE.NoColorSpace,
+        depthBuffer: false,
+        stencilBuffer: false,
+        generateMipmaps: false,
+      });
+    } else if (this.ptCaptureTarget.width !== w || this.ptCaptureTarget.height !== h) {
+      this.ptCaptureTarget.setSize(w, h);
+    }
+
+    const neededBytes = w * h * 4;
+    if (!this.ptCaptureBuffer || this.ptCaptureBuffer.length !== neededBytes) {
+      this.ptCaptureBuffer = new Uint8Array(neededBytes);
+    }
+
+    const prevTarget = this.renderer.getRenderTarget();
+    const prevAutoClear = this.renderer.autoClear;
+    const prevXrEnabled = this.renderer.xr.enabled;
+
+    try {
+      this.ptCaptureMaterial!.uniforms.map.value = srcTarget.texture;
+      this.ptCaptureMaterial!.uniforms.uExposure.value = this.renderer.toneMappingExposure;
+      this.renderer.autoClear = false;
+      this.renderer.xr.enabled = false;
+      this.renderer.setRenderTarget(this.ptCaptureTarget);
+      this.renderer.render(this.ptCaptureScene, this.ptCaptureCamera!);
+      this.renderer.readRenderTargetPixels(
+        this.ptCaptureTarget,
+        0,
+        0,
+        w,
+        h,
+        this.ptCaptureBuffer,
+      );
+      return createImageDataFromGlRgba(this.ptCaptureBuffer, w, h);
+    } catch {
+      return null;
+    } finally {
+      if (this.ptCaptureMaterial) {
+        this.ptCaptureMaterial.uniforms.map.value = null;
+      }
+      this.renderer.setRenderTarget(prevTarget);
+      this.renderer.autoClear = prevAutoClear;
+      this.renderer.xr.enabled = prevXrEnabled;
+    }
   }
 
   private withPathTracerSceneState<T>(fn: () => T): T {
@@ -752,10 +934,10 @@ export class ThreeViewportEngine {
         const pt = this.ensurePathTracer();
         pt.bounces = this.isSoftwareGl ? Math.min(ptSettings.bounces, 2) : ptSettings.bounces;
         pt.renderScale = this.isSoftwareGl
-          ? Math.min(ptSettings.renderScale, 0.25)
+          ? Math.min(ptSettings.renderScale, 0.15)
           : ptSettings.renderScale;
 
-        if (pt.samples < 1 || this.ptDirty.scene || this.ptDirty.reset) {
+        if (pt.samples === 0 || this.ptDirty.scene || this.ptDirty.reset) {
           if (this.probesDirty) {
             this.updateReflectionProbes();
           }
@@ -794,15 +976,6 @@ export class ThreeViewportEngine {
             }
           }
 
-          const t0 = performance.now();
-          (window as unknown as Record<string, unknown>).__ptDiag = {
-            stage: 'before-sample',
-            rawSamples: pt.samples,
-            isCompiling: pt.isCompiling,
-            tiles: [pt.tiles.x, pt.tiles.y],
-            renderScale: pt.renderScale,
-            bounces: pt.bounces,
-          };
           if (ptSettings.paused) {
             pt.pausePathTracing = true;
             pt.renderSample();
@@ -824,29 +997,24 @@ export class ThreeViewportEngine {
               maxSamples: ptSettings.maxSamples,
             });
 
-            if (!complete) {
+            if (complete) {
+              if (ptSettings.denoiserEnabled && !this.denoisedForCurrentRun) {
+                this.denoisedForCurrentRun = true;
+                const noisyImage =
+                  this.capturePathTracerTargetImageData(pt) ??
+                  this.denoiserService.captureFromCanvas(this.renderer.domElement);
+                if (noisyImage) {
+                  void this.denoiserService.denoiseImageData(noisyImage, this.denoiserOverlayCanvas);
+                }
+              }
+            } else {
               this.renderDirty = true;
             }
           }
-          const dtSample = Math.round(performance.now() - t0);
-          (window as unknown as Record<string, unknown>).__ptDiag = {
-            stage: 'after-sample',
-            rawSamples: pt.samples,
-            isCompiling: pt.isCompiling,
-            tiles: [pt.tiles.x, pt.tiles.y],
-            renderScale: pt.renderScale,
-            bounces: pt.bounces,
-            dtSample,
-            renderDirty: this.renderDirty,
-            renderBusy: this.renderBusy,
-            doneCount: (((window as unknown as Record<string, { doneCount?: number }>).__ptDiag)?.doneCount ?? 0),
-          };
         });
       }
 
       const done = () => {
-        const d = (window as unknown as Record<string, { doneCount?: number }>).__ptDiag;
-        if (d) d.doneCount = (d.doneCount ?? 0) + 1;
         this.renderBusy = false;
         if (this.renderDirty) this.requestRender();
       };
@@ -860,24 +1028,10 @@ export class ThreeViewportEngine {
   }
 
   private afterDraw(cb: () => void): void {
-    const gl = this.renderer.getContext() as WebGL2RenderingContext;
-    if (!gl || typeof gl.fenceSync !== 'function') {
-      this.timerId = window.setTimeout(cb, 30);
-      return;
-    }
-    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-    gl.flush();
-    const poll = () => {
-      if (this.disposed) return;
-      const state = sync ? gl.getSyncParameter(sync, gl.SYNC_STATUS) : gl.SIGNALED;
-      if (state === gl.UNSIGNALED) {
-        this.timerId = window.setTimeout(poll, 5);
-      } else {
-        if (sync) gl.deleteSync(sync);
-        this.timerId = window.setTimeout(cb, 40);
-      }
-    };
-    this.timerId = window.setTimeout(poll, 5);
+    // On software GL (SwiftShader), yield between frames so the GPU queue never
+    // saturates and Chromium's compositor/UI remain responsive without fenceSync IPC.
+    const delayMs = this.isPathTracerEnabled() && !this.pathTracerInteracting ? 650 : 120;
+    this.timerId = window.setTimeout(cb, delayMs);
   }
 
   public applySceneSettings(settings: SceneSettings): void {
@@ -894,20 +1048,39 @@ export class ThreeViewportEngine {
       prev.bounceIntensity !== settings.bounceIntensity;
     const pauseChanged = prev.pathTracer.paused !== settings.pathTracer.paused;
     const maxSamplesChanged = prev.pathTracer.maxSamples !== settings.pathTracer.maxSamples;
+    const denoiserEnabledChanged =
+      prev.pathTracer.denoiserEnabled !== settings.pathTracer.denoiserEnabled;
+    const exposureChanged = prev.toneMappingExposure !== settings.toneMappingExposure;
 
     if (engineChanged) {
+      this.invalidateDenoiser();
       clearTimeout(this.pathTracerIdleTimer);
       this.pathTracerInteracting = false;
       if (settings.renderEngine === 'pathtracer') {
         this.ptDirty.scene = true;
+      } else {
+        this.reportPathTracerStatus({
+          phase: 'idle',
+          samples: 0,
+          maxSamples: settings.pathTracer.maxSamples,
+        });
       }
     } else if (bounceOrScaleChanged) {
       this.notifyPathTracerInteraction({ reset: true });
     } else if (envChanged) {
       this.notifyPathTracerInteraction({ environment: true });
-    } else if (pauseChanged || maxSamplesChanged) {
+    } else if (pauseChanged || maxSamplesChanged || denoiserEnabledChanged || exposureChanged) {
       clearTimeout(this.pathTracerIdleTimer);
       this.pathTracerInteracting = false;
+      if (maxSamplesChanged && this.pathTracer && Math.floor(this.pathTracer.samples) < settings.pathTracer.maxSamples) {
+        this.invalidateDenoiser();
+      }
+      if (denoiserEnabledChanged && !settings.pathTracer.denoiserEnabled) {
+        this.invalidateDenoiser();
+      }
+      if (exposureChanged && this.isPathTracerEnabled()) {
+        this.invalidateDenoiser();
+      }
     }
 
     this.syncLightingAndEnvironment();
@@ -919,6 +1092,9 @@ export class ThreeViewportEngine {
     settings?: SceneSettings,
   ): void {
     const prevMode = this.shadingMode;
+    const prevLightStatus = this.lightStatus;
+    const prevSettings = this.currentSettings;
+
     this.shadingMode = mode;
     this.lightStatus =
       typeof lightStatus === 'boolean'
@@ -932,9 +1108,27 @@ export class ThreeViewportEngine {
     if (settings) {
       this.currentSettings = settings;
     }
-    if (mode === 'render' && prevMode !== 'render' && this.currentSettings.renderEngine === 'pathtracer') {
+
+    const lightStatusChanged =
+      prevLightStatus.hasAny !== this.lightStatus.hasAny ||
+      prevLightStatus.hasDirectional !== this.lightStatus.hasDirectional ||
+      prevLightStatus.hasLocalOnly !== this.lightStatus.hasLocalOnly ||
+      prevLightStatus.maxDirectionalIntensity !== this.lightStatus.maxDirectionalIntensity;
+    const envSettingsChanged =
+      prevSettings.backgroundColor !== this.currentSettings.backgroundColor ||
+      prevSettings.ambientIntensity !== this.currentSettings.ambientIntensity ||
+      prevSettings.bounceIntensity !== this.currentSettings.bounceIntensity;
+
+    if (mode !== 'render') {
+      this.invalidateDenoiser();
+    } else if (prevMode !== 'render' && this.currentSettings.renderEngine === 'pathtracer') {
+      this.invalidateDenoiser();
       this.ptDirty.scene = true;
-    } else if (this.currentSettings.renderEngine === 'pathtracer') {
+    } else if (
+      this.currentSettings.renderEngine === 'pathtracer' &&
+      (lightStatusChanged || envSettingsChanged)
+    ) {
+      this.invalidateDenoiser();
       this.ptDirty.environment = true;
     }
     this.syncLightingAndEnvironment();
@@ -1792,6 +1986,39 @@ export class ThreeViewportEngine {
   }
 
   public exportSnapshotPng(): string {
+    const denoiserStatus = this.denoiserService.getStatus();
+    if (
+      this.isPathTracerEnabled() &&
+      !this.pathTracerInteracting &&
+      denoiserStatus.hasResult &&
+      denoiserStatus.phase === 'ready' &&
+      denoiserStatus.viewMode === 'denoised'
+    ) {
+      const targetW = this.renderer.domElement.width;
+      const targetH = this.renderer.domElement.height;
+      const overlayW = this.denoiserOverlayCanvas.width;
+      const overlayH = this.denoiserOverlayCanvas.height;
+      if (
+        targetW > 0 &&
+        targetH > 0 &&
+        overlayW > 0 &&
+        overlayH > 0 &&
+        (overlayW !== targetW || overlayH !== targetH)
+      ) {
+        const scratch = document.createElement('canvas');
+        scratch.width = targetW;
+        scratch.height = targetH;
+        const ctx = scratch.getContext('2d');
+        if (ctx) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          ctx.drawImage(this.denoiserOverlayCanvas, 0, 0, targetW, targetH);
+          return scratch.toDataURL('image/png');
+        }
+      }
+      return this.denoiserOverlayCanvas.toDataURL('image/png');
+    }
+
     if (
       this.isPathTracerEnabled() &&
       this.pathTracer &&
@@ -1854,6 +2081,16 @@ export class ThreeViewportEngine {
     for (const id of Array.from(this.reflectionProbes.keys())) {
       this.disposeProbe(id);
     }
+    this.denoiserService.dispose();
+    this.ptCaptureTarget?.dispose();
+    this.ptCaptureTarget = null;
+    this.ptCaptureMaterial?.dispose();
+    this.ptCaptureMaterial = null;
+    this.ptCaptureMesh?.geometry.dispose();
+    this.ptCaptureMesh = null;
+    this.ptCaptureScene = null;
+    this.ptCaptureCamera = null;
+    this.ptCaptureBuffer = null;
     this.pathTracer?.dispose();
     this.pathTracer = null;
     this.pathTracerEnvTexture?.dispose();
@@ -1871,6 +2108,9 @@ export class ThreeViewportEngine {
     (this.shadowCatcher.material as THREE.Material).dispose();
     this.renderer.dispose();
 
+    if (this.denoiserOverlayCanvas.parentElement === this.container) {
+      this.container.removeChild(this.denoiserOverlayCanvas);
+    }
     if (dom.parentElement === this.container) {
       this.container.removeChild(dom);
     }

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, Aperture, Box, PanelLeft, PanelRight, Upload, X } from 'lucide-react';
 import { InspectorPanel } from './components/InspectorPanel';
 import { OutlinerPanel } from './components/OutlinerPanel';
@@ -28,8 +28,11 @@ import {
   duplicateNode,
 } from './editor/sceneModel';
 import { ThreeViewportEngine } from './editor/threeEngine';
+import { createInitialDenoiserStatus } from './editor/oidnDenoiser';
 import type {
   CameraState,
+  DenoiserStatus,
+  DenoiserViewMode,
   LightKind,
   LightProps,
   MaterialProps,
@@ -72,6 +75,9 @@ export default function App() {
     samples: 0,
     maxSamples: initialProject.settings.pathTracer?.maxSamples ?? 128,
   }));
+  const [denoiserStatus, setDenoiserStatus] = useState<DenoiserStatus>(() =>
+    createInitialDenoiserStatus(),
+  );
 
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<ThreeViewportEngine | null>(null);
@@ -79,7 +85,7 @@ export default function App() {
   const dragCounterRef = useRef(0);
 
   const selectedNode = project.nodes.find((n) => n.id === selectedNodeId) ?? null;
-  const lightStatus = classifySceneLights(project.nodes);
+  const lightStatus = useMemo(() => classifySceneLights(project.nodes), [project.nodes]);
 
   // Keep latest callbacks in ref so Three.js engine mounts once and never resets
   const engineCallbacksRef = useRef({
@@ -97,6 +103,9 @@ export default function App() {
     },
     onPathTracerStatusChange: (status: PathTracerStatus) => {
       setPathTracerStatus(status);
+    },
+    onDenoiserStatusChange: (status: DenoiserStatus) => {
+      setDenoiserStatus(status);
     },
   });
 
@@ -146,6 +155,7 @@ export default function App() {
       onCameraChange: (cam) => engineCallbacksRef.current.onCameraChange(cam),
       onContextLostChange: (lost) => setContextLost(lost),
       onPathTracerStatusChange: (status) => engineCallbacksRef.current.onPathTracerStatusChange(status),
+      onDenoiserStatusChange: (status) => engineCallbacksRef.current.onDenoiserStatusChange(status),
     });
 
     engineRef.current = engine;
@@ -364,6 +374,10 @@ export default function App() {
     engineRef.current?.resetPathTracer();
   }, []);
 
+  const handleChangeDenoiserViewMode = useCallback((mode: DenoiserViewMode) => {
+    engineRef.current?.setDenoiserViewMode(mode);
+  }, []);
+
   const handleResetCamera = useCallback(() => {
     const defaultCam: CameraState = {
       position: { x: 5.2, y: 3.8, z: 6.4 },
@@ -579,6 +593,8 @@ export default function App() {
       data-render-engine={project.settings.renderEngine}
       data-pt-phase={pathTracerStatus.phase}
       data-pt-samples={pathTracerStatus.samples}
+      data-denoiser-phase={denoiserStatus.phase}
+      data-denoiser-view={denoiserStatus.viewMode}
       data-pitch-black={viewportMode === 'render' && !lightStatus.hasAny ? 'true' : 'false'}
       data-dark-render={viewportMode === 'render' && !lightStatus.hasDirectional ? 'true' : 'false'}
     >
@@ -785,6 +801,7 @@ export default function App() {
             selectedNode={selectedNode}
             sceneSettings={project.settings}
             pathTracerStatus={pathTracerStatus}
+            denoiserStatus={denoiserStatus}
             onUpdateNodeName={handleUpdateNodeName}
             onUpdateTransform={handleUpdateTransform}
             onUpdateMaterial={handleUpdateMaterial}
@@ -796,6 +813,7 @@ export default function App() {
             onDeleteNode={handleDeleteNode}
             onUpdateSceneSettings={handleUpdateSceneSettings}
             onResetPathTracer={handleResetPathTracer}
+            onChangeDenoiserViewMode={handleChangeDenoiserViewMode}
             onResetCamera={handleResetCamera}
           />
         )}

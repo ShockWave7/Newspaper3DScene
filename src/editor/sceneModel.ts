@@ -117,12 +117,14 @@ export function createDefaultPathTracerSettings(
     maxSamples: 128,
     renderScale: 0.75,
     paused: false,
+    denoiserEnabled: true,
   };
   return {
     bounces: Math.round(clamp(partial?.bounces ?? base.bounces, 1, 12)),
     maxSamples: Math.round(clamp(partial?.maxSamples ?? base.maxSamples, 8, 512)),
     renderScale: roundTo(clamp(partial?.renderScale ?? base.renderScale, 0.25, 1), 2),
     paused: Boolean(partial?.paused ?? base.paused),
+    denoiserEnabled: partial?.denoiserEnabled !== false,
   };
 }
 

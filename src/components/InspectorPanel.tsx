@@ -18,6 +18,8 @@ import {
   roundTo,
 } from '../editor/sceneModel';
 import type {
+  DenoiserStatus,
+  DenoiserViewMode,
   LightProps,
   MaterialProps,
   PathTracerStatus,
@@ -31,6 +33,7 @@ interface InspectorPanelProps {
   selectedNode: SceneNode | null;
   sceneSettings: SceneSettings;
   pathTracerStatus: PathTracerStatus;
+  denoiserStatus: DenoiserStatus;
   onUpdateNodeName: (id: string, name: string) => void;
   onUpdateTransform: (id: string, transform: TransformProps) => void;
   onUpdateMaterial: (id: string, material: MaterialProps) => void;
@@ -45,6 +48,7 @@ interface InspectorPanelProps {
   onDeleteNode: (id: string) => void;
   onUpdateSceneSettings: (settings: SceneSettings) => void;
   onResetPathTracer: () => void;
+  onChangeDenoiserViewMode: (mode: DenoiserViewMode) => void;
   onResetCamera: () => void;
 }
 
@@ -65,6 +69,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   selectedNode,
   sceneSettings,
   pathTracerStatus,
+  denoiserStatus,
   onUpdateNodeName,
   onUpdateTransform,
   onUpdateMaterial,
@@ -76,6 +81,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
   onDeleteNode,
   onUpdateSceneSettings,
   onResetPathTracer,
+  onChangeDenoiserViewMode,
   onResetCamera,
 }) => {
   const [activeTab, setActiveTab] = useState<'object' | 'scene'>('object');
@@ -96,6 +102,20 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
           : pathTracerStatus.phase === 'preview'
             ? 'Предпросмотр'
             : 'Ожидание';
+
+  const denoiserProgressPct = Math.min(100, Math.max(0, Math.round(denoiserStatus.progress * 100)));
+  const denoiserPhaseLabel =
+    denoiserStatus.phase === 'ready'
+      ? 'ИИ-денойз готов'
+      : denoiserStatus.phase === 'denoising'
+        ? `ИИ-денойз… ${denoiserProgressPct}%`
+        : denoiserStatus.phase === 'loading-model'
+          ? 'Загрузка весов OIDN…'
+          : denoiserStatus.phase === 'unsupported'
+            ? 'WebGPU недоступен — показан оригинал'
+            : denoiserStatus.phase === 'error'
+              ? denoiserStatus.errorMessage || 'Ошибка денойзера'
+              : 'Запуск после завершения семплов';
 
   const effectiveTab = selectedNode ? activeTab : activeTab === 'scene' ? 'scene' : 'object';
 
@@ -1073,6 +1093,95 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
                       }
                       className="w-full studio-range"
                     />
+                  </div>
+
+                  {/* AI Denoiser (OIDN WebGPU) */}
+                  <div className="pt-2.5 border-t border-white/10 space-y-2">
+                    <label className="flex items-center justify-between gap-2 text-xs text-slate-200 cursor-pointer">
+                      <span>Авто-денойз (OIDN WebGPU)</span>
+                      <input
+                        type="checkbox"
+                        data-testid="pt-denoiser-toggle"
+                        checked={ptSettings.denoiserEnabled}
+                        onChange={(e) =>
+                          onUpdateSceneSettings({
+                            ...sceneSettings,
+                            pathTracer: {
+                              ...ptSettings,
+                              denoiserEnabled: e.target.checked,
+                            },
+                          })
+                        }
+                        className="accent-[#3B82F6] w-3.5 h-3.5"
+                      />
+                    </label>
+
+                    {(ptSettings.denoiserEnabled || denoiserStatus.phase !== 'idle') && (
+                      <div className="space-y-1.5">
+                        <div
+                          data-testid="pt-denoiser-status"
+                          className={`text-[11px] leading-snug ${
+                            denoiserStatus.phase === 'ready'
+                              ? 'text-emerald-400'
+                              : denoiserStatus.phase === 'unsupported' || denoiserStatus.phase === 'error'
+                                ? 'text-amber-300'
+                                : 'text-slate-400'
+                          }`}
+                        >
+                          {denoiserPhaseLabel}
+                        </div>
+
+                        {(denoiserStatus.phase === 'loading-model' ||
+                          denoiserStatus.phase === 'denoising') && (
+                          <div className="w-full h-1 rounded-full bg-white/10 overflow-hidden">
+                            <div
+                              className="h-full bg-emerald-500 transition-all duration-150"
+                              style={{
+                                width:
+                                  denoiserStatus.phase === 'loading-model'
+                                    ? '18%'
+                                    : `${Math.max(8, denoiserProgressPct)}%`,
+                              }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {denoiserStatus.hasResult && denoiserStatus.phase === 'ready' && (
+                      <div
+                        role="group"
+                        aria-label="Режим просмотра результата денойзера"
+                        className="grid grid-cols-2 gap-1 p-0.5 bg-[#16191E] rounded border border-white/10"
+                      >
+                        <button
+                          type="button"
+                          data-testid="pt-view-denoised"
+                          aria-pressed={denoiserStatus.viewMode === 'denoised'}
+                          onClick={() => onChangeDenoiserViewMode('denoised')}
+                          className={`py-1 px-2 text-[11px] font-medium rounded transition-colors cursor-pointer ${
+                            denoiserStatus.viewMode === 'denoised'
+                              ? 'bg-emerald-600 text-white'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          Денойз
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="pt-view-original"
+                          aria-pressed={denoiserStatus.viewMode === 'original'}
+                          onClick={() => onChangeDenoiserViewMode('original')}
+                          className={`py-1 px-2 text-[11px] font-medium rounded transition-colors cursor-pointer ${
+                            denoiserStatus.viewMode === 'original'
+                              ? 'bg-[#3B82F6] text-white'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          Оригинал
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

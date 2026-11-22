@@ -254,6 +254,7 @@ test('PathTracer settings default to standard engine, clamp options, and round-t
     maxSamples: 128,
     renderScale: 0.75,
     paused: false,
+    denoiserEnabled: true,
   });
 
   const clamped = createDefaultPathTracerSettings({
@@ -261,11 +262,13 @@ test('PathTracer settings default to standard engine, clamp options, and round-t
     maxSamples: 2,
     renderScale: 0.1,
     paused: true,
+    denoiserEnabled: false,
   });
   assert.equal(clamped.bounces, 12);
   assert.equal(clamped.maxSamples, 8);
   assert.equal(clamped.renderScale, 0.25);
   assert.equal(clamped.paused, true);
+  assert.equal(clamped.denoiserEnabled, false);
 
   const project = createEmptyProject('PT тест');
   project.settings = createDefaultSceneSettings({
@@ -275,6 +278,7 @@ test('PathTracer settings default to standard engine, clamp options, and round-t
       maxSamples: 256,
       renderScale: 0.5,
       paused: true,
+      denoiserEnabled: false,
     },
   });
 
@@ -285,5 +289,6 @@ test('PathTracer settings default to standard engine, clamp options, and round-t
     maxSamples: 256,
     renderScale: 0.5,
     paused: true,
+    denoiserEnabled: false,
   });
 });

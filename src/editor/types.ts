@@ -26,12 +26,31 @@ export interface PathTracerSettings {
   maxSamples: number;
   renderScale: number;
   paused: boolean;
+  denoiserEnabled: boolean;
 }
 
 export interface PathTracerStatus {
   phase: 'idle' | 'preview' | 'tracing' | 'paused' | 'complete';
   samples: number;
   maxSamples: number;
+}
+
+export type DenoiserPhase =
+  | 'idle'
+  | 'loading-model'
+  | 'denoising'
+  | 'ready'
+  | 'unsupported'
+  | 'error';
+
+export type DenoiserViewMode = 'denoised' | 'original';
+
+export interface DenoiserStatus {
+  phase: DenoiserPhase;
+  progress: number;
+  viewMode: DenoiserViewMode;
+  hasResult: boolean;
+  errorMessage?: string;
 }
 
 export interface Vec3Tuple {
